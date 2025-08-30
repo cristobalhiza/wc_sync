@@ -1,0 +1,53 @@
+name: build-windows-exe
+
+on:
+  workflow_dispatch: {}           
+  push:
+    tags: ['v*']               
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build exe (PyInstaller)
+        run: |
+          pyinstaller --onefile --name cultivarte_wc_sync ^
+            --hidden-import=mysql.connector.locales.eng.client_error ^
+            --hidden-import=mysql.connector.locales.eng.numbers ^
+            --hidden-import=mysql.connector.plugins.mysql_native_password ^
+            --hidden-import=mysql.connector.plugins.caching_sha2_password ^
+            sync_wc_orders.py
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item dist\cultivarte_wc_sync.exe package\
+          Copy-Item run_sync.bat package\
+          Copy-Item README_DEPLOY.txt package\README.txt
+          Copy-Item .env.example package\.env
+          Compress-Archive -Path package\* -DestinationPath cultivarte_wc_sync.zip
+
+      - name: Upload artifact (Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cultivarte_wc_sync
+          path: cultivarte_wc_sync.zip
+
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: cultivarte_wc_sync.zip
