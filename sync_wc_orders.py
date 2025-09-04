@@ -42,6 +42,24 @@ def db():
         print(f"[DB ERROR] {e}")
         raise
 
+def crear_tabla_clientes():
+    sql = """CREATE TABLE IF NOT EXISTS clientes (
+        email VARCHAR(255) PRIMARY KEY,
+        id_cliente_wc INT,
+        nombre VARCHAR(255),
+        apellido VARCHAR(255),
+        empresa VARCHAR(255),
+        telefono VARCHAR(255),
+        direccion VARCHAR(255),
+        comuna VARCHAR(255),
+        pais VARCHAR(255),
+        fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )"""
+    with db() as conn:
+        c = conn.cursor()
+        c.execute(sql)
+
 def q_scalar(sql, params=None):
     with db() as conn:
         c = conn.cursor()
@@ -147,6 +165,42 @@ def upsert_order(o, created_aware_utc: datetime):
         c = conn.cursor()
         c.execute(sql, (order_id, created_naive, customer, status, currency, total_tax, shipping_total))
 
+
+def actualizar_o_insertar_cliente(o):
+    billing = o.get("billing") or {}
+    email = (billing.get("email") or "").strip()
+    if not email:
+        return
+
+    sql = """INSERT INTO clientes
+      (email, id_cliente_wc, nombre, apellido, empresa, telefono, direccion, comuna, pais)
+      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+      ON DUPLICATE KEY UPDATE
+        id_cliente_wc=VALUES(id_cliente_wc),
+        nombre=VALUES(nombre),
+        apellido=VALUES(apellido),
+        empresa=VALUES(empresa),
+        telefono=VALUES(telefono),
+        direccion=VALUES(direccion),
+        comuna=VALUES(comuna),
+        pais=VALUES(pais)
+    """
+    params = (
+        email,
+        o.get("customer_id") or 0,
+        billing.get("first_name",""),
+        billing.get("last_name",""),
+        billing.get("company",""),
+        billing.get("phone",""),
+        billing.get("address_1",""),
+        billing.get("state",""),
+        billing.get("country","")
+    )
+    with db() as conn:
+        c = conn.cursor()
+        c.execute(sql, params)
+
+
 def upsert_line(order_id, line_type, line_id, item_name, sku, qty, value_net):
     sql = """INSERT INTO wc_order_lines
       (order_id, line_type, line_id, item_name, sku, quantity, value_net)
@@ -162,6 +216,8 @@ def upsert_line(order_id, line_type, line_id, item_name, sku, qty, value_net):
 
 def run():
     t0 = time.time()
+
+    crear_tabla_clientes()
 
     before_orders = count_orders()
     before_lines  = count_lines_total()
@@ -179,6 +235,7 @@ def run():
             newest = created_utc
 
         upsert_order(o, created_utc)
+        actualizar_o_insertar_cliente(o)
         order_ids.append(int(o["id"]))
 
         for li in (o.get("line_items") or []):
