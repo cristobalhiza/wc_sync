@@ -1,17 +1,17 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem Configuración
+rem ================== Config ==================
 set "LOG=sync.log"
 set "LOGDIR=logs"
 set "MAX_SIZE=5242880"   rem 5 MB
 set "KEEP_ROTATED=10"
 
-rem Ir a la carpeta del script
+rem ============== Ir a carpeta base ===========
 set "BASE=%~dp0"
 cd /d "%BASE%"
 
-rem Detectar .exe
+rem ============== Detectar .exe ===============
 set "EXE="
 for %%F in (*.exe) do if not defined EXE set "EXE=%%F"
 
@@ -26,8 +26,9 @@ call :rotate_if_needed
 for /f %%I in ('powershell -NoP -C "(Get-Date).ToString(\"yyyyMMdd_HHmmss\")"') do set "RUNTS=%%I"
 set "RUNLOG=%TEMP%\sync_run_%RUNTS%_%RANDOM%.log"
 
+rem ============== Ejecutar y loguear ==========
 echo [%date% %time%] Running %EXE% > "%RUNLOG%"
-start "" /wait "%EXE%" >> "%RUNLOG%" 2>&1
+"%EXE%" >> "%RUNLOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [%date% %time%] Done (código !RC!) >> "%RUNLOG%"
 
@@ -37,6 +38,7 @@ if not "!RC!"=="0" (
   goto :after_run
 )
 
+rem ============== Heurística de errores =======
 set "HAS_TXT_ERROR=0"
 findstr /i ^
  /c:"error" ^
@@ -70,13 +72,12 @@ if "!HAS_TXT_ERROR!"=="1" (
 
 :after_run
 del "%RUNLOG%" >nul 2>&1
-
 call :rotate_if_needed
 
 endlocal
 exit /b
 
-rem Funciones
+rem ============== Funciones ===================
 :rotate_if_needed
 if not exist "%LOG%" goto :eof
 for %%A in ("%LOG%") do set "SIZE=%%~zA"
