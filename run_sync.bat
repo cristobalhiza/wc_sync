@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 rem ================== Config ==================
-set "LOG=sync.log"
+set "LOG=sync_general.log"
 set "LOGDIR=logs"
 set "MAX_SIZE=5242880"   rem 5 MB
 set "KEEP_ROTATED=10"

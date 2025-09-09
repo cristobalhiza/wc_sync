@@ -1,4 +1,4 @@
-import os, time, sys
+import os, time, sys, logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -6,7 +6,6 @@ from pathlib import Path
 import requests
 import mysql.connector as mysql
 from dotenv import load_dotenv
-
 
 def load_env():
     if getattr(sys, "frozen", False):
@@ -128,24 +127,26 @@ def db():
         return mysql.connect(
             **DB_CFG,
             use_pure=True,
-            auth_plugin="mysql_native_password" 
+            auth_plugin="mysql_native_password"
         )
     except Exception as e:
-        print(f"[DB ERROR] {e}")
+        logging.error(f"[DB ERROR] {e}")
         raise
 
 def crear_tabla_clientes():
-    # Se añade la columna 'unidad' a la definición de la tabla
+    # MODIFICADO: Se añade la columna 'rut'
     sql = """CREATE TABLE IF NOT EXISTS wc_customers (
         email VARCHAR(255) PRIMARY KEY,
         id_cliente_wc INT,
         nombre VARCHAR(100),
         apellido VARCHAR(100),
+        rut VARCHAR(20),
         telefono VARCHAR(40),
         direccion VARCHAR(255),
         unidad VARCHAR(50),
         comuna VARCHAR(100),
         pais VARCHAR(60),
+        notas_pedido TEXT,
         fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )"""
@@ -209,11 +210,11 @@ def wc_get_orders(after_aware_utc: datetime):
     base = {
         "consumer_key": WC_KEY,
         "consumer_secret": WC_SECRET,
-        "orderby": "date",
+        "orderby": "modified",
         "order": "asc",
         "status": "processing,completed",
         "per_page": per_page,
-        "after": after_aware_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "modified_after": after_aware_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     while True:
         params = dict(base, page=page)
@@ -230,23 +231,32 @@ def wc_get_orders(after_aware_utc: datetime):
     return orders
 
 def upsert_order(o, created_aware_utc: datetime):
+    # MODIFICADO: Se añade 'tipo_documento' al INSERT y al UPDATE
     sql = """INSERT INTO wc_orders
-      (order_id, order_date, customer_name, status, currency, total_tax, shipping_total)
-      VALUES (%s,%s,%s,%s,%s,%s,%s)
+      (order_id, order_date, customer_name, status, currency, total_tax, shipping_total, customer_note, tipo_documento)
+      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
       ON DUPLICATE KEY UPDATE
        order_date=VALUES(order_date),
        customer_name=VALUES(customer_name),
        status=VALUES(status),
        currency=VALUES(currency),
        total_tax=VALUES(total_tax),
-       shipping_total=VALUES(shipping_total)"""
+       shipping_total=VALUES(shipping_total),
+       customer_note=VALUES(customer_note),
+       tipo_documento=VALUES(tipo_documento)"""
     order_id = int(o["id"])
     created_naive = created_aware_utc.replace(tzinfo=None)
 
     billing = o.get("billing") or {}
-    customer = f"{billing.get('first_name','').strip()} {billing.get('last_name','').strip()}".strip()
+    customer = f"{billing.get('first_name','')}" + " " + f"{billing.get('last_name','')}".strip().strip()
     status = o.get("status","")
     currency = o.get("currency","")
+    
+    customer_note = o.get("customer_note", "")
+
+    # NUEVO: Extraer los datos tributarios del objeto que viene de la API
+    datos_tributarios = o.get("datos_tributarios_cl", {})
+    tipo_documento = datos_tributarios.get("tipo_documento", "Boleta") # Por defecto 'Boleta'
 
     try:
         shipping_total = Decimal(str(o.get("shipping_total","0")))
@@ -259,8 +269,8 @@ def upsert_order(o, created_aware_utc: datetime):
 
     with db() as conn:
         c = conn.cursor()
-        c.execute(sql, (order_id, created_naive, customer, status, currency, total_tax, shipping_total))
-
+        # MODIFICADO: Se añade 'tipo_documento' a los parámetros
+        c.execute(sql, (order_id, created_naive, customer, status, currency, total_tax, shipping_total, customer_note, tipo_documento))
 
 def actualizar_o_insertar_cliente(o):
     billing = o.get("billing") or {}
@@ -268,15 +278,25 @@ def actualizar_o_insertar_cliente(o):
     if not email:
         return
 
+    # NUEVO: Extraer el RUT
+    datos_tributarios = o.get("datos_tributarios_cl", {})
+    rut = datos_tributarios.get("rut", "").strip()
+
     direccion_calle = billing.get("address_1", "").strip()
     unidad = billing.get("address_2", "").strip()
 
     codigo_comuna = billing.get("state", "")
     nombre_comuna = COMUNA_MAP.get(codigo_comuna, codigo_comuna)
 
-    sql = """INSERT INTO wc_customers
-        (email, id_cliente_wc, nombre, apellido, telefono, direccion, unidad, comuna, pais)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    # MODIFICADO: Se añade el RUT al INSERT.
+    sql_insert = """INSERT INTO wc_customers
+        (email, id_cliente_wc, nombre, apellido, telefono, direccion, unidad, comuna, pais, rut)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    
+    # MODIFICADO: Se actualizan los campos básicos y se añade una lógica condicional para el RUT.
+    # El RUT solo se actualiza si viene un valor nuevo en el pedido.
+    sql_update_base = """
         ON DUPLICATE KEY UPDATE
         id_cliente_wc=VALUES(id_cliente_wc),
         nombre=VALUES(nombre),
@@ -287,17 +307,25 @@ def actualizar_o_insertar_cliente(o):
         comuna=VALUES(comuna),
         pais=VALUES(pais)
     """
-    params = (
-        email,
-        o.get("customer_id") or 0,
-        billing.get("first_name",""),
-        billing.get("last_name",""),
-        billing.get("phone",""),
-        direccion_calle,
-        unidad,
-        nombre_comuna,
-        billing.get("country","")
-    )
+    sql_update_rut = ", rut=VALUES(rut)"
+
+    # Combinar las sentencias SQL
+    if rut:
+        # Si el pedido trae un RUT, se actualiza todo, incluyendo el RUT.
+        sql = sql_insert + sql_update_base + sql_update_rut
+        params = (
+            email, o.get("customer_id") or 0, billing.get("first_name",""), billing.get("last_name",""),
+            billing.get("phone",""), direccion_calle, unidad, nombre_comuna, billing.get("country",""), rut
+        )
+    else:
+        # Si el pedido NO trae RUT (es Boleta), no se actualiza el campo RUT en la BD.
+        # Así se preserva un RUT ingresado en una compra anterior.
+        sql = sql_insert + sql_update_base
+        params = (
+            email, o.get("customer_id") or 0, billing.get("first_name",""), billing.get("last_name",""),
+            billing.get("phone",""), direccion_calle, unidad, nombre_comuna, billing.get("country",""), None # Parámetro para el RUT en el INSERT
+        )
+    
     with db() as conn:
         c = conn.cursor()
         c.execute(sql, params)
@@ -333,11 +361,13 @@ def run():
     order_ids = []
 
     for o in orders:
-        created_utc = parse_gmt(o.get("date_created_gmt") or o.get("date_created"))
+        created_utc = parse_gmt(o.get("date_modified_gmt") or o.get("date_modified"))
         if created_utc > newest:
             newest = created_utc
 
-        upsert_order(o, created_utc)
+        order_creation_date_utc = parse_gmt(o.get("date_created_gmt") or o.get("date_created"))
+        upsert_order(o, order_creation_date_utc)
+        
         actualizar_o_insertar_cliente(o)
         order_ids.append(int(o["id"]))
 
@@ -394,19 +424,20 @@ def run():
 
     elapsed = time.time() - t0
 
-    print("=== Woo Sync Summary ===")
-    print(f"After (prev)  : {last_after_prev.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"Orders fetched: {len(orders)}")
+    logger = logging.getLogger(__name__)
+    logger.info("=== Woo Sync Summary ===")
+    logger.info(f"After (prev)  : {last_after_prev.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"Orders fetched: {len(orders)}")
     if order_ids:
         ids_list = ", ".join(str(x) for x in order_ids[:10])
         more = "" if len(order_ids) <= 10 else f" (+{len(order_ids)-10} más)"
-        print(f"Order IDs     : {ids_list}{more}")
-    print(f"New orders    : +{delta_orders}")
-    print(f"New clients   : +{delta_customers}")
-    print(f"New lines     : +{delta_lines}  (por tipo: {', '.join(f'{k}:+{v}' for k,v in delta_bytype.items())})")
-    print(f"After (new)   : {watermark_new.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"Elapsed       : {elapsed:.2f}s")
-    print("========================")
+        logger.info(f"Order IDs     : {ids_list}{more}")
+    logger.info(f"New orders    : +{delta_orders}")
+    logger.info(f"New clients   : +{delta_customers}")
+    logger.info(f"New lines     : +{delta_lines}  (por tipo: {', '.join(f'{k}:+{v}' for k,v in delta_bytype.items())})")
+    logger.info(f"After (new)   : {watermark_new.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"Elapsed       : {elapsed:.2f}s")
+    logger.info("========================")
 
 if __name__ == "__main__":
     run()
