@@ -1,4 +1,6 @@
-import os, time, sys
+import os
+import time
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -7,6 +9,7 @@ import requests
 import mysql.connector as mysql
 from dotenv import load_dotenv
 
+# --- 1. CONFIGURACIÓN ---
 
 def load_env():
     if getattr(sys, "frozen", False):
@@ -17,21 +20,20 @@ def load_env():
 
 load_env()
 
-WC_BASE   = os.getenv("WC_BASE_URL","").rstrip("/")
-WC_KEY    = os.getenv("WC_KEY")
+WC_BASE = os.getenv("WC_BASE_URL", "").rstrip("/")
+WC_KEY = os.getenv("WC_KEY")
 WC_SECRET = os.getenv("WC_SECRET")
 
 DB_CFG = dict(
     host=os.getenv("DB_HOST"),
-    port=int(os.getenv("DB_PORT","3306")),
+    port=int(os.getenv("DB_PORT", "3306")),
     user=os.getenv("DB_USER"),
     password=os.getenv("DB_PASS"),
     database=os.getenv("DB_NAME"),
-    autocommit=True,
+    autocommit=False, 
 )
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS","3"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 
-# Diccionario para traducir códigos de comunas a nombres legibles
 COMUNA_MAP = {
     "CL-RM": "Santiago",
     'CL_100': 'Algarrobo', 'CL_101': 'Alhué', 'CL_102': 'Alto Biobío', 'CL_103': 'Alto del Carmen',
@@ -123,21 +125,19 @@ COMUNA_MAP = {
     'CL_442': 'Yerbas Buenas', 'CL_443': 'Yumbel', 'CL_444': 'Yungay', 'CL_445': 'Zapallar',
 }
 
+# --- 2. FUNCIONES DE BASE DE DATOS (MODIFICADAS) ---
+
 def db():
     try:
-        return mysql.connect(
-            **DB_CFG,
-            use_pure=True,
-            auth_plugin="mysql_native_password" 
-        )
+        return mysql.connect(**DB_CFG, use_pure=True, auth_plugin="mysql_native_password")
     except Exception as e:
         print(f"[DB ERROR] {e}")
         raise
 
-def crear_tabla_clientes():
-    # Se añade la columna 'unidad' a la definición de la tabla
+def crear_tabla_clientes(conn):
     sql = """CREATE TABLE IF NOT EXISTS wc_customers (
-        email VARCHAR(255) PRIMARY KEY,
+        id_cliente INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
         id_cliente_wc INT,
         nombre VARCHAR(100),
         apellido VARCHAR(100),
@@ -146,34 +146,48 @@ def crear_tabla_clientes():
         unidad VARCHAR(50),
         comuna VARCHAR(100),
         pais VARCHAR(60),
+        rut VARCHAR(20),
         fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_email (email)
     )"""
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(sql)
+    c = conn.cursor()
+    c.execute(sql)
 
-def q_scalar(sql, params=None):
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(sql, params or ())
-        row = c.fetchone()
-        return row[0] if row else 0
+def q_scalar(conn, sql, params=None):
+    c = conn.cursor()
+    c.execute(sql, params or ())
+    row = c.fetchone()
+    return row[0] if row else 0
 
-def count_orders():
-    return q_scalar("SELECT COUNT(*) FROM wc_orders")
+def count_orders(conn):
+    return q_scalar(conn, "SELECT COUNT(*) FROM wc_orders")
 
-def count_customers():
-    return q_scalar("SELECT COUNT(*) FROM wc_customers")
+def count_customers(conn):
+    return q_scalar(conn, "SELECT COUNT(*) FROM wc_customers")
 
-def count_lines_total():
-    return q_scalar("SELECT COUNT(*) FROM wc_order_lines")
+def count_lines_total(conn):
+    return q_scalar(conn, "SELECT COUNT(*) FROM wc_order_lines")
 
-def count_lines_by_type():
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT line_type, COUNT(*) FROM wc_order_lines GROUP BY line_type")
-        return {k: v for k, v in c.fetchall()}
+def count_lines_by_type(conn):
+    c = conn.cursor()
+    c.execute("SELECT line_type, COUNT(*) FROM wc_order_lines GROUP BY line_type")
+    return {k: v for k, v in c.fetchall()}
+
+def get_last_after(conn) -> datetime:
+    c = conn.cursor()
+    c.execute("SELECT last_after FROM wc_sync_state WHERE id=1")
+    row = c.fetchone()
+    if row and row[0]:
+        return row[0].replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+
+def set_last_after(conn, dt_aware_utc: datetime):
+    dt_naive = dt_aware_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    c = conn.cursor()
+    c.execute("UPDATE wc_sync_state SET last_after=%s WHERE id=1", (dt_naive,))
+
+# --- 3. FUNCIONES DE WOOCOMMERCE Y PARSEO ---
 
 def parse_gmt(s: str) -> datetime:
     s = (s or "").strip()
@@ -183,36 +197,17 @@ def parse_gmt(s: str) -> datetime:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     else:
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
-def get_last_after() -> datetime:
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT last_after FROM wc_sync_state WHERE id=1")
-        row = c.fetchone()
-        if row and row[0]:
-            return row[0].replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-
-def set_last_after(dt_aware_utc: datetime):
-    dt_naive = dt_aware_utc.astimezone(timezone.utc).replace(tzinfo=None)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE wc_sync_state SET last_after=%s WHERE id=1", (dt_naive,))
 
 def wc_get_orders(after_aware_utc: datetime):
     per_page = 100
     page = 1
     orders = []
     base = {
-        "consumer_key": WC_KEY,
-        "consumer_secret": WC_SECRET,
-        "orderby": "date",
-        "order": "asc",
-        "status": "processing,completed",
-        "per_page": per_page,
+        "consumer_key": WC_KEY, "consumer_secret": WC_SECRET, "orderby": "date",
+        "order": "asc", "status": "processing,completed", "per_page": per_page,
         "after": after_aware_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     while True:
@@ -220,192 +215,170 @@ def wc_get_orders(after_aware_utc: datetime):
         r = requests.get(f"{WC_BASE}/wp-json/wc/v3/orders", params=params, timeout=60)
         r.raise_for_status()
         chunk = r.json()
-        if not chunk:
-            break
+        if not chunk: break
         orders.extend(chunk)
-        if len(chunk) < per_page:
-            break
+        if len(chunk) < per_page: break
         page += 1
         time.sleep(0.2)
     return orders
 
-def upsert_order(o, created_aware_utc: datetime):
-    sql = """INSERT INTO wc_orders
-      (order_id, order_date, customer_name, status, currency, total_tax, shipping_total)
-      VALUES (%s,%s,%s,%s,%s,%s,%s)
-      ON DUPLICATE KEY UPDATE
-       order_date=VALUES(order_date),
-       customer_name=VALUES(customer_name),
-       status=VALUES(status),
-       currency=VALUES(currency),
-       total_tax=VALUES(total_tax),
-       shipping_total=VALUES(shipping_total)"""
-    order_id = int(o["id"])
-    created_naive = created_aware_utc.replace(tzinfo=None)
+# --- 4. FUNCIONES UPSERT (FINALES Y COMPLETAS) ---
 
+def upsert_order(conn, o, created_aware_utc: datetime):
+    sql = """INSERT INTO wc_orders
+        (order_id, order_date, customer_name, status, currency, total_tax, shipping_total, customer_note, tipo_documento)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+        order_date=VALUES(order_date), customer_name=VALUES(customer_name), status=VALUES(status),
+        currency=VALUES(currency), total_tax=VALUES(total_tax), shipping_total=VALUES(shipping_total),
+        customer_note=VALUES(customer_note), tipo_documento=VALUES(tipo_documento)"""
+    
     billing = o.get("billing") or {}
     customer = f"{billing.get('first_name','').strip()} {billing.get('last_name','').strip()}".strip()
-    status = o.get("status","")
-    currency = o.get("currency","")
-
+    
     try:
-        shipping_total = Decimal(str(o.get("shipping_total","0")))
+        shipping_total = Decimal(str(o.get("shipping_total", "0")))
     except Exception:
         shipping_total = Decimal("0")
-    if not shipping_total:
-        shipping_total = sum(Decimal(str(sl.get("total","0"))) for sl in (o.get("shipping_lines") or []))
+    if not shipping_total and shipping_total != Decimal("0"):
+        shipping_total = sum(Decimal(str(sl.get("total", "0"))) for sl in (o.get("shipping_lines") or []))
+    
+    total_tax = Decimal(str(o.get("total_tax", "0")))
+    datos_cl = o.get('datos_tributarios_cl', {})
+    tipo_documento = datos_cl.get('tipo_documento', 'Boleta')
 
-    total_tax = Decimal(str(o.get("total_tax","0")))
+    c = conn.cursor()
+    c.execute(sql, (
+        int(o["id"]), created_aware_utc.replace(tzinfo=None), customer, o.get("status", ""),
+        o.get("currency", ""), total_tax, shipping_total, o.get("customer_note", ""), tipo_documento
+    ))
 
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(sql, (order_id, created_naive, customer, status, currency, total_tax, shipping_total))
-
-
-def actualizar_o_insertar_cliente(o):
+def actualizar_o_insertar_cliente(conn, o):
     billing = o.get("billing") or {}
+    shipping = o.get("shipping") or {}
+    telefono = billing.get("phone", "")
+    if not telefono:
+        telefono = shipping.get("phone", "")
     email = (billing.get("email") or "").strip()
-    if not email:
-        return
+    if not email: return
 
-    direccion_calle = billing.get("address_1", "").strip()
-    unidad = billing.get("address_2", "").strip()
-
+    datos_cl = o.get('datos_tributarios_cl', {})
+    rut_cliente = datos_cl.get('rut', '')
     codigo_comuna = billing.get("state", "")
     nombre_comuna = COMUNA_MAP.get(codigo_comuna, codigo_comuna)
 
     sql = """INSERT INTO wc_customers
-        (email, id_cliente_wc, nombre, apellido, telefono, direccion, unidad, comuna, pais)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (email, id_cliente_wc, nombre, apellido, telefono, direccion, unidad, comuna, pais, rut)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-        id_cliente_wc=VALUES(id_cliente_wc),
-        nombre=VALUES(nombre),
-        apellido=VALUES(apellido),
-        telefono=VALUES(telefono),
-        direccion=VALUES(direccion),
-        unidad=VALUES(unidad),
-        comuna=VALUES(comuna),
-        pais=VALUES(pais)
-    """
+        id_cliente_wc=VALUES(id_cliente_wc), nombre=VALUES(nombre), apellido=VALUES(apellido),
+        telefono=VALUES(telefono), direccion=VALUES(direccion), unidad=VALUES(unidad),
+        comuna=VALUES(comuna), pais=VALUES(pais), rut=VALUES(rut)"""
+    
     params = (
-        email,
-        o.get("customer_id") or 0,
-        billing.get("first_name",""),
-        billing.get("last_name",""),
-        billing.get("phone",""),
-        direccion_calle,
-        unidad,
-        nombre_comuna,
-        billing.get("country","")
+        email, o.get("customer_id") or 0, billing.get("first_name", ""), billing.get("last_name", ""),
+        telefono, billing.get("address_1", "").strip(), billing.get("address_2", "").strip(),
+        nombre_comuna, billing.get("country", ""), rut_cliente
     )
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(sql, params)
+    c = conn.cursor()
+    c.execute(sql, params)
 
-
-def upsert_line(order_id, line_type, line_id, item_name, sku, qty, value_net):
+def upsert_line(conn, order_id, line_type, line_id, item_name, sku, qty, value_net):
     sql = """INSERT INTO wc_order_lines
         (order_id, line_type, line_id, item_name, sku, quantity, value_net)
         VALUES (%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE
-        item_name=VALUES(item_name),
-        sku=VALUES(sku),
-        quantity=VALUES(quantity),
-        value_net=VALUES(value_net)"""
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(sql, (order_id, line_type, line_id, item_name, sku, qty, value_net))
+        item_name=VALUES(item_name), sku=VALUES(sku),
+        quantity=VALUES(quantity), value_net=VALUES(value_net)"""
+    c = conn.cursor()
+    c.execute(sql, (order_id, line_type, line_id, item_name, sku, qty, value_net))
+
+# --- 5. FUNCIÓN PRINCIPAL (RUN) ---
 
 def run():
     t0 = time.time()
+    print("=== Iniciando Sincronización con WooCommerce ===")
 
-    crear_tabla_clientes()
+    with db() as conn:
+        try:
+            crear_tabla_clientes(conn)
+            before_orders = count_orders(conn)
+            before_lines = count_lines_total(conn)
+            before_bytype = count_lines_by_type(conn)
+            before_customers = count_customers(conn)
+            
+            last_after_prev = get_last_after(conn)
+            newest = last_after_prev
+            orders = wc_get_orders(last_after_prev)
+            order_ids = []
+            
+            if not orders:
+                print("No se encontraron órdenes nuevas.")
+            else:
+                print(f"Se encontraron {len(orders)} órdenes para procesar...")
 
-    before_orders = count_orders()
-    before_lines  = count_lines_total()
-    before_bytype = count_lines_by_type()
-    before_customers = count_customers()
+            for o in orders:
+                order_id = o.get('id', 'N/A')
+                try:
+                    created_utc = parse_gmt(o.get("date_created_gmt") or o.get("date_created"))
+                    if created_utc > newest: newest = created_utc
+                    
+                    upsert_order(conn, o, created_utc)
+                    actualizar_o_insertar_cliente(conn, o)
+                    order_ids.append(int(order_id))
 
-    last_after_prev = get_last_after()
-    newest = last_after_prev
+                    for li in (o.get("line_items") or []):
+                        upsert_line(conn, int(order_id), "PRODUCT", int(li["id"]), li.get("name", ""), li.get("sku", ""), Decimal(str(li.get("quantity", 1))), Decimal(str(li.get("total", "0"))))
+                    for sh in (o.get("shipping_lines") or []):
+                        upsert_line(conn, int(order_id), "SHIPPING", int(sh["id"]), (sh.get("method_title") or "Despacho"), "", Decimal("1"), Decimal(str(sh.get("total", "0"))))
+                    
+                    iva_total = Decimal(str(o.get("total_tax", "0")))
+                    if iva_total != 0:
+                        upsert_line(conn, int(order_id), "IVA", 0, "IVA", "", Decimal("1"), iva_total)
 
-    orders = wc_get_orders(last_after_prev)
-    order_ids = []
+                    conn.commit()
+                    print(f"Orden #{order_id} procesada y guardada exitosamente.")
+                except Exception as e:
+                    print(f"--> ERROR al procesar orden #{order_id}: {e}. Revirtiendo cambios.")
+                    conn.rollback()
 
-    for o in orders:
-        created_utc = parse_gmt(o.get("date_created_gmt") or o.get("date_created"))
-        if created_utc > newest:
-            newest = created_utc
+            if orders:
+                set_last_after(conn, newest + timedelta(seconds=1))
+                conn.commit()
+                watermark_new = newest + timedelta(seconds=1)
+            else:
+                watermark_new = last_after_prev
 
-        upsert_order(o, created_utc)
-        actualizar_o_insertar_cliente(o)
-        order_ids.append(int(o["id"]))
+            after_orders = count_orders(conn)
+            after_lines = count_lines_total(conn)
+            after_customers = count_customers(conn)
+            after_bytype = count_lines_by_type(conn)
 
-        for li in (o.get("line_items") or []):
-            upsert_line(
-                order_id=int(o["id"]),
-                line_type="PRODUCT",
-                line_id=int(li["id"]),
-                item_name=li.get("name",""),
-                sku=li.get("sku",""),
-                qty=Decimal(str(li.get("quantity",1))),
-                value_net=Decimal(str(li.get("total","0")))
-            )
+            delta_orders = after_orders - before_orders
+            delta_lines = after_lines - before_lines
+            delta_customers = after_customers - before_customers
+            types = sorted(set(before_bytype) | set(after_bytype))
+            delta_bytype = {t: after_bytype.get(t,0) - before_bytype.get(t,0) for t in types}
 
-        for sh in (o.get("shipping_lines") or []):
-            upsert_line(
-                order_id=int(o["id"]),
-                line_type="SHIPPING",
-                line_id=int(sh["id"]),
-                item_name=(sh.get("method_title") or "Despacho"),
-                sku="",
-                qty=Decimal("1"),
-                value_net=Decimal(str(sh.get("total","0")))
-            )
+            elapsed = time.time() - t0
 
-        iva_total = Decimal(str(o.get("total_tax","0")))
-        if iva_total != 0:
-            upsert_line(
-                order_id=int(o["id"]),
-                line_type="IVA",
-                line_id=0,
-                item_name="IVA",
-                sku="",
-                qty=Decimal("1"),
-                value_net=iva_total
-            )
+            print("\n=== Woo Sync Summary ===")
+            print(f"After (prev)  : {last_after_prev.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"Orders fetched: {len(orders)}")
+            if order_ids:
+                ids_list = ", ".join(str(x) for x in order_ids[:10])
+                more = "" if len(order_ids) <= 10 else f" (+{len(order_ids)-10} más)"
+                print(f"Order IDs     : {ids_list}{more}")
+            print(f"New orders    : +{delta_orders}")
+            print(f"New clients   : +{delta_customers}")
+            print(f"New lines     : +{delta_lines}  (por tipo: {', '.join(f'{k}:+{v}' for k,v in delta_bytype.items() if v > 0)})")
+            print(f"After (new)   : {watermark_new.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"Elapsed       : {elapsed:.2f}s")
 
-    if orders:
-        set_last_after(newest + timedelta(seconds=1))
-        watermark_new = newest + timedelta(seconds=1)
-    else:
-        watermark_new = last_after_prev
-
-    after_orders = count_orders()
-    after_lines  = count_lines_total()
-    after_bytype = count_lines_by_type()
-    after_customers = count_customers()
-
-    delta_orders = after_orders - before_orders
-    delta_lines  = after_lines  - before_lines
-    delta_customers = after_customers - before_customers
-    types = set(before_bytype) | set(after_bytype)
-    delta_bytype = {t: after_bytype.get(t,0) - before_bytype.get(t,0) for t in sorted(types)}
-
-    elapsed = time.time() - t0
-
-    print("=== Woo Sync Summary ===")
-    print(f"After (prev)  : {last_after_prev.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"Orders fetched: {len(orders)}")
-    if order_ids:
-        ids_list = ", ".join(str(x) for x in order_ids[:10])
-        more = "" if len(order_ids) <= 10 else f" (+{len(order_ids)-10} más)"
-        print(f"Order IDs     : {ids_list}{more}")
-    print(f"New orders    : +{delta_orders}")
-    print(f"New clients   : +{delta_customers}")
-    print(f"New lines     : +{delta_lines}  (por tipo: {', '.join(f'{k}:+{v}' for k,v in delta_bytype.items())})")
-    print(f"After (new)   : {watermark_new.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"Elapsed       : {elapsed:.2f}s")
+        except Exception as e:
+            print(f"--> ERROR CRÍTICO durante la ejecución: {e}")
+            conn.rollback()
+    
     print("========================")
 
 if __name__ == "__main__":

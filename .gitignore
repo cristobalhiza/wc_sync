@@ -9,3 +9,5 @@ dist/
 *.log
 
 .env
+
+productos_filtro.txt
